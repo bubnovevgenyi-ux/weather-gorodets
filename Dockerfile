@@ -1,4 +1,5 @@
-FROM python:3.12-slim
+# Pin Debian 12: Playwright 1.52.0 has Debian Bookworm dependency metadata.
+FROM python:3.12-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
