@@ -1,0 +1,19 @@
+services:
+  weather:
+    build: .
+    container_name: weather-gorodets
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      TZ: Europe/Moscow
+      WEATHER_TIMEZONE: Europe/Moscow
+      OUTPUT_DIR: /app/output
+      DEBUG_DIR: /app/debug
+    volumes:
+      - ./output:/app/output
+      - ./debug:/app/debug
+    shm_size: "1gb"
+    init: true
