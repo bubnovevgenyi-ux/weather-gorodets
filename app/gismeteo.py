@@ -384,7 +384,7 @@ class GismeteoClient:
         for raw in raw_values:
             parsed = _parse_datetime_title(raw)
             if parsed is None:
-                match = re.search(r"(?<!\\d)(\\d{1,2}):(\\d{2})(?!\\d)", raw)
+                match = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)", raw)
                 if match:
                     try:
                         parsed = datetime(
@@ -433,25 +433,6 @@ class GismeteoClient:
                 "HTML сохранён в /app/debug."
             )
 
-        if not raw_times:
-            data_stat_values = sorted({
-                str(node.get("data-stat-value", "")).strip()
-                for node in soup.select("[data-stat-value]")
-                if node.get("data-stat-value")
-            })
-            class_hints = sorted({
-                cls
-                for node in soup.select('[class*="time"], [class*="date"], [class*="widget-row"]')
-                for cls in node.get("class", [])
-            })
-            page_title = _text(soup.title)
-            body_sample = _text(soup.body)[:700] if soup.body else _text(soup)[:700]
-            raise RuntimeError(
-                f"На странице {label} не найден временной ряд. "
-                f"Заголовок: {page_title!r}; data-stat-value: {data_stat_values[:30]}; "
-                f"похожие классы: {class_hints[:40]}; текст страницы: {body_sample!r}. "
-                "Сохранён HTML в /app/debug."
-            )
         times = parsed_times
 
         values = {
