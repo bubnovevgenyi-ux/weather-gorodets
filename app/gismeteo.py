@@ -66,6 +66,19 @@ def _parse_datetime_title(value: str) -> datetime | None:
             parsed = parsed.replace(tzinfo=ZoneInfo(settings.timezone))
         return parsed
 
+    # Numeric Russian date forms: "05.11.2026, 03:00" or "05/11, 03:00".
+    numeric = re.search(r"(\d{1,2})[./](\d{1,2})(?:[./](20\d{2}))?[, T]+.*?(\d{1,2}):(\d{2})", value)
+    if numeric:
+        day, month = int(numeric.group(1)), int(numeric.group(2))
+        year = int(numeric.group(3)) if numeric.group(3) else datetime.now(ZoneInfo(settings.timezone)).year
+        now_date = datetime.now(ZoneInfo(settings.timezone)).date()
+        if not numeric.group(3) and month == 1 and now_date.month == 12 and day < now_date.day:
+            year += 1
+        try:
+            return datetime(year, month, day, int(numeric.group(4)), int(numeric.group(5)), tzinfo=ZoneInfo(settings.timezone))
+        except ValueError:
+            pass
+
     # Alternative date forms seen in title attributes: "5 нояб, 03:00".
     m = re.search(r"(\d{1,2})\s+([А-Яа-яЁё]+)[, ]+.*?(\d{1,2}):(\d{2})", value)
     if m:
@@ -228,22 +241,47 @@ class GismeteoClient:
 
     def _parse_hourly_page(self, html: str, label: str) -> list[ForecastPoint]:
         soup = BeautifulSoup(html, "lxml")
-        raw_times = self._values(soup, self.HOURLY_SELECTORS["times"], "title")
+        raw_times = [
+            value for value in self._values(soup, self.HOURLY_SELECTORS["times"], "title")
+            if _parse_datetime_title(value) is not None
+        ]
         if not raw_times:
-            # Fallback: discover timestamp titles even if Gismeteo changed the row wrapper/classes.
+            # Fallback: inspect title/time attributes when Gismeteo changes row wrappers or class names.
             discovered: list[str] = []
             seen: set[str] = set()
-            for node in soup.select("[title]"):
-                title = str(node.get("title", "")).strip()
+            candidates = soup.select("[title], [datetime], [data-time], [data-date]")
+            for node in candidates:
+                title = str(
+                    node.get("title")
+                    or node.get("datetime")
+                    or node.get("data-time")
+                    or node.get("data-date")
+                    or ""
+                ).strip()
                 if not title or _parse_datetime_title(title) is None:
                     continue
                 classes = " ".join(node.get("class", []))
                 parent_classes = " ".join(node.parent.get("class", [])) if node.parent else ""
                 context = f"{classes} {parent_classes}".lower()
-                if any(token in context for token in ("time", "row-item", "date")):
-                    if title not in seen:
+                # Prefer nodes from a time/date row; if classes have been renamed,
+                # retain all parseable timestamps as the final fallback.
+                if any(token in context for token in ("time", "row-item", "date")) and title not in seen:
+                    seen.add(title)
+                    discovered.append(title)
+
+            if not discovered:
+                for node in candidates:
+                    title = str(
+                        node.get("title")
+                        or node.get("datetime")
+                        or node.get("data-time")
+                        or node.get("data-date")
+                        or ""
+                    ).strip()
+                    if title and _parse_datetime_title(title) is not None and title not in seen:
                         seen.add(title)
                         discovered.append(title)
+
             raw_times = discovered
 
         if not raw_times:
