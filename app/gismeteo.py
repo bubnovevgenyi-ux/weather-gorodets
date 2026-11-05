@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 from .config import settings
 from .models import DailyPoint, ForecastPoint
@@ -136,7 +137,58 @@ class GismeteoClient:
         self.tz = ZoneInfo(settings.timezone)
 
     async def _get_html(self, path: str, debug_name: str) -> str:
+        """Load the forecast in Chromium so JavaScript-rendered rows are present in the DOM."""
         url = f"{self.BASE}{path}"
+        debug_path = settings.debug_dir / f"{debug_name}.html"
+        browser_error: Exception | None = None
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage"],
+                )
+                try:
+                    context = await browser.new_context(
+                        locale="ru-RU",
+                        timezone_id=settings.timezone,
+                        user_agent=settings.user_agent,
+                        viewport={"width": 1440, "height": 1200},
+                    )
+                    page = await context.new_page()
+                    response = await page.goto(
+                        url,
+                        wait_until="domcontentloaded",
+                        timeout=settings.browser_timeout_ms,
+                    )
+                    # The chart is sometimes hydrated after the first HTML response.
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=10_000)
+                    except PlaywrightTimeoutError:
+                        pass
+                    try:
+                        await page.wait_for_selector(
+                            '.widget-row-time, [class*="row-time"], [data-stat-value]',
+                            timeout=8_000,
+                        )
+                    except PlaywrightTimeoutError:
+                        # Save the rendered DOM anyway; diagnostics below will explain what is missing.
+                        pass
+                    await page.wait_for_timeout(1_000)
+                    html = await page.content()
+                    status = response.status if response else None
+                    if len(html) < 3_000:
+                        raise RuntimeError(
+                            f"Chromium получил слишком короткую страницу ({len(html)} байт), HTTP {status}"
+                        )
+                    debug_path.write_text(html, encoding="utf-8")
+                    return html
+                finally:
+                    await browser.close()
+        except Exception as exc:
+            browser_error = exc
+
+        # Keep an HTTP fallback for hosts where Chromium navigation is unavailable.
         headers = {
             "User-Agent": settings.user_agent,
             "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
@@ -144,25 +196,27 @@ class GismeteoClient:
             "Referer": settings.base_url + "/",
         }
         last_error: Exception | None = None
-        async with httpx.AsyncClient(
-            headers=headers,
-            timeout=settings.request_timeout_seconds,
-            follow_redirects=True,
-        ) as client:
-            for attempt in range(3):
-                try:
-                    response = await client.get(url)
-                    response.raise_for_status()
-                    html = response.text
-                    if len(html) < 10_000:
-                        raise RuntimeError(f"Получена подозрительно короткая HTML-страница ({len(html)} байт)")
-                    (settings.debug_dir / f"{debug_name}.html").write_text(html, encoding="utf-8")
-                    return html
-                except Exception as exc:  # network retries are deliberately bounded
-                    last_error = exc
-                    if attempt < 2:
-                        await asyncio.sleep(1.5 * (attempt + 1))
-        raise RuntimeError(f"Не удалось получить страницу Gismeteo {url}: {last_error}") from last_error
+        try:
+            async with httpx.AsyncClient(
+                headers=headers,
+                timeout=settings.request_timeout_seconds,
+                follow_redirects=True,
+            ) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                html = response.text
+                debug_path.write_text(html, encoding="utf-8")
+                if len(html) < 3_000:
+                    raise RuntimeError(f"Получена слишком короткая HTML-страница ({len(html)} байт)")
+                return html
+        except Exception as exc:
+            last_error = exc
+
+        raise RuntimeError(
+            f"Не удалось получить страницу Gismeteo {url}. "
+            f"Chromium: {browser_error}; HTTP: {last_error}. "
+            f"Диагностика сохранена в {debug_path}"
+        ) from last_error
 
     @staticmethod
     def _values(soup: BeautifulSoup, selector: str, attr: str | None = None) -> list[str]:
@@ -176,9 +230,40 @@ class GismeteoClient:
         soup = BeautifulSoup(html, "lxml")
         raw_times = self._values(soup, self.HOURLY_SELECTORS["times"], "title")
         if not raw_times:
+            # Fallback: discover timestamp titles even if Gismeteo changed the row wrapper/classes.
+            discovered: list[str] = []
+            seen: set[str] = set()
+            for node in soup.select("[title]"):
+                title = str(node.get("title", "")).strip()
+                if not title or _parse_datetime_title(title) is None:
+                    continue
+                classes = " ".join(node.get("class", []))
+                parent_classes = " ".join(node.parent.get("class", [])) if node.parent else ""
+                context = f"{classes} {parent_classes}".lower()
+                if any(token in context for token in ("time", "row-item", "date")):
+                    if title not in seen:
+                        seen.add(title)
+                        discovered.append(title)
+            raw_times = discovered
+
+        if not raw_times:
+            data_stat_values = sorted({
+                str(node.get("data-stat-value", "")).strip()
+                for node in soup.select("[data-stat-value]")
+                if node.get("data-stat-value")
+            })
+            class_hints = sorted({
+                cls
+                for node in soup.select('[class*="time"], [class*="date"], [class*="widget-row"]')
+                for cls in node.get("class", [])
+            })
+            page_title = _text(soup.title)
+            body_sample = _text(soup.body)[:700] if soup.body else _text(soup)[:700]
             raise RuntimeError(
                 f"На странице {label} не найден временной ряд. "
-                "Возможно, Gismeteo изменил HTML-разметку. Сохранён HTML в /app/debug."
+                f"Заголовок: {page_title!r}; data-stat-value: {data_stat_values[:30]}; "
+                f"похожие классы: {class_hints[:40]}; текст страницы: {body_sample!r}. "
+                "Сохранён HTML в /app/debug."
             )
         times = [_parse_datetime_title(value) for value in raw_times]
         if any(item is None for item in times):
