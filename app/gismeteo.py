@@ -375,28 +375,64 @@ class GismeteoClient:
         return []
 
     def _time_values(self, soup: BeautifulSoup, label: str) -> list[datetime]:
-        raw_values = self._values(soup, self.HOURLY_SELECTORS["times"])
-        result: list[datetime] = []
         day = datetime.now(self.tz).date()
         if label.lower() == "завтра":
             day += timedelta(days=1)
 
-        for raw in raw_values:
-            parsed = _parse_datetime_title(raw)
-            if parsed is None:
-                match = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)", raw)
-                if match:
-                    try:
-                        parsed = datetime(
-                            day.year, day.month, day.day,
-                            int(match.group(1)), int(match.group(2)),
-                            tzinfo=self.tz,
-                        )
-                    except ValueError:
-                        parsed = None
-            if parsed is not None and parsed not in result:
-                result.append(parsed)
-        return result
+        # Try selectors one by one and accept only a selector that actually yields timestamps.
+        for selector in self.HOURLY_SELECTORS["times"]:
+            parsed_values: list[datetime] = []
+            for node in soup.select(selector):
+                raw = str(
+                    node.get("title") or node.get("datetime")
+                    or node.get("data-time") or node.get("data-date") or _text(node)
+                )
+                raw = _clean_duplicate_fragment(raw)
+                parsed = _parse_datetime_title(raw)
+                if parsed is None:
+                    match = re.search(r"(?<!\\d)(\\d{1,2}):(\\d{2})(?!\\d)", raw)
+                    if match:
+                        try:
+                            parsed = datetime(
+                                day.year, day.month, day.day,
+                                int(match.group(1)), int(match.group(2)),
+                                tzinfo=self.tz,
+                            )
+                        except ValueError:
+                            parsed = None
+                if parsed is not None and parsed not in parsed_values:
+                    parsed_values.append(parsed)
+            if parsed_values:
+                return sorted(parsed_values)
+        return []
+
+    def _daily_dates(self, soup: BeautifulSoup) -> list[date]:
+        for selector in self.DAILY_SELECTORS["dates"]:
+            parsed_values: list[date] = []
+            for node in soup.select(selector):
+                raw = str(
+                    node.get("title") or node.get("datetime")
+                    or node.get("data-date") or _text(node)
+                )
+                parsed = _parse_russian_date(_clean_duplicate_fragment(raw))
+                if parsed is not None and parsed not in parsed_values:
+                    parsed_values.append(parsed)
+            if parsed_values:
+                return parsed_values
+
+        # Last fallback: date labels sometimes have a different wrapper but retain
+        # a semantic class name. Avoid scanning arbitrary page text/nav links.
+        parsed_values = []
+        for node in soup.select('[class*="date"], .w_time[title], [datetime], [data-date]'):
+            raw = str(
+                node.get("title") or node.get("datetime")
+                or node.get("data-date") or _text(node)
+            )
+            parsed = _parse_russian_date(_clean_duplicate_fragment(raw))
+            classes = " ".join(node.get("class", [])).lower()
+            if parsed is not None and ("date" in classes or "time" in classes) and parsed not in parsed_values:
+                parsed_values.append(parsed)
+        return parsed_values
 
     def _parse_hourly_page(self, html: str, label: str) -> list[ForecastPoint]:
         soup = BeautifulSoup(html, "lxml")
@@ -497,13 +533,22 @@ class GismeteoClient:
 
     def _parse_daily(self, html: str) -> list[DailyPoint]:
         soup = BeautifulSoup(html, "lxml")
-        raw_dates = self._values(soup, self.DAILY_SELECTORS["dates"])
-        if not raw_dates:
+        dates = self._daily_dates(soup)
+        if not dates:
+            data_widget_ids = sorted({
+                str(node.get("data-widget-id", "")).strip()
+                for node in soup.select("[data-widget-id]")
+                if node.get("data-widget-id")
+            })
+            date_classes = sorted({
+                cls for node in soup.select('[class*="date"], [class*="time"]')
+                for cls in node.get("class", [])
+            })
             raise RuntimeError(
                 "На странице долгосрочного прогноза не найдены даты. "
-                "Возможно, Gismeteo изменил HTML-разметку. Сохранён HTML в /app/debug."
+                f"data-widget-id: {data_widget_ids[:30]}; классы дат: {date_classes[:50]}. "
+                "HTML сохранён в /app/debug."
             )
-        dates = [_parse_russian_date(value) for value in raw_dates]
         values = {
             "tmax": self._values(soup, self.DAILY_SELECTORS["tmax"]),
             "tmin": self._values(soup, self.DAILY_SELECTORS["tmin"]),
@@ -518,8 +563,6 @@ class GismeteoClient:
         }
         result: list[DailyPoint] = []
         for i, day in enumerate(dates):
-            if day is None:
-                continue
             result.append(DailyPoint(
                 date=day.isoformat(),
                 weekday=WEEKDAYS[day.weekday()],
