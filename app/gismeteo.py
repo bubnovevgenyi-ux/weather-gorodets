@@ -390,7 +390,7 @@ class GismeteoClient:
                 raw = _clean_duplicate_fragment(raw)
                 parsed = _parse_datetime_title(raw)
                 if parsed is None:
-                    match = re.search(r"(?<!\\d)(\\d{1,2}):(\\d{2})(?!\\d)", raw)
+                    match = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)", raw)
                     if match:
                         try:
                             parsed = datetime(
