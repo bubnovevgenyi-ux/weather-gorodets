@@ -318,6 +318,20 @@ class GismeteoClient:
             "humidity": self._values(soup, self.HOURLY_SELECTORS["humidity"]),
             "summary": self._values(soup, self.HOURLY_SELECTORS["summary"], "data-text"),
         }
+        if not any(_number(value) is not None for value in values["temperature"]):
+            data_stat_values = sorted({
+                str(node.get("data-stat-value", "")).strip()
+                for node in soup.select("[data-stat-value]")
+                if node.get("data-stat-value")
+            })
+            match_counts = {key: len(items) for key, items in values.items()}
+            raise RuntimeError(
+                f"Временные метки на странице {label} найдены ({len(times)}), "
+                f"но значения температуры не извлечены. Количество элементов по селекторам: "
+                f"{match_counts}; data-stat-value: {data_stat_values[:30]}. "
+                "HTML сохранён в /app/debug для диагностики."
+            )
+
         points: list[ForecastPoint] = []
         for i, dt in enumerate(times):
             assert dt is not None
