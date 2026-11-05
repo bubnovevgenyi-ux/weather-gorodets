@@ -32,8 +32,36 @@ MONTHS = {
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
 
+def _clean_duplicate_fragment(value: str) -> str:
+    """Collapse only a value duplicated inside one DOM cell, never across forecast cells."""
+    value = re.sub(r"\s+", " ", str(value).replace("\xa0", " ")).strip()
+    if not value:
+        return value
+
+    # Broken/duplicated clock labels sometimes arrive as 0:000:00 or "0:00 0:00".
+    value = re.sub(r"(?<!\d)(\d{1,2}:\d{2})\1(?!\d)", r"\1", value)
+    clock_pair = re.fullmatch(r"(\d{1,2}:\d{2})\s+\1", value)
+    if clock_pair:
+        return clock_pair.group(1)
+
+    # The same leaf can be emitted twice by desktop/mobile variants nested in one cell.
+    parts = value.split()
+    if len(parts) == 2 and parts[0] == parts[1]:
+        return parts[0]
+    return value
+
+
 def _text(node: Any) -> str:
-    return " ".join(node.stripped_strings) if node else ""
+    if not node:
+        return ""
+    fragments = [_clean_duplicate_fragment(part) for part in node.stripped_strings]
+    fragments = [part for part in fragments if part]
+    # Collapse adjacent identical fragments only within this one selected DOM element.
+    compact: list[str] = []
+    for fragment in fragments:
+        if not compact or compact[-1] != fragment:
+            compact.append(fragment)
+    return _clean_duplicate_fragment(" ".join(compact))
 
 
 def _number(value: str | None) -> float | None:
@@ -121,29 +149,130 @@ class GismeteoClient:
     """Reads the public page markup. CSS selectors are isolated here for easy maintenance."""
 
     BASE = f"{settings.base_url}/weather-gorodets-{settings.city_id}/"
+    # Modern Gismeteo widget classes first; legacy selectors are retained as fallbacks.
     HOURLY_SELECTORS = {
-        "times": 'div[data-stat-value*="weather"] div.widget-row-time div.row-item',
-        "temperature": 'div[data-stat-value*="weather"] div.widget-row-chart-temperature div.value span.unit_temperature_c',
-        "pressure": 'div[data-stat-value*="pressure"] div.widget-row-chart-pressure div.value span.unit_pressure_mm_hg_atm',
-        "wind_speed": 'div[data-stat-value*="wind"] div.widget-row-wind-speed div.row-item span.unit_wind_m_s',
-        "wind_gust": 'div[data-stat-value*="wind"] div.widget-row-wind-gust div.row-item span.unit_wind_m_s',
-        "wind_direction": 'div[data-stat-value*="wind"] div.widget-row-wind-direction div.row-item div.direction',
-        "precipitation": 'div[data-stat-value*="weather"] div.widget-row-precipitation-bars div.row-item div.item-unit',
-        "humidity": 'div[data-stat-value*="humidity"] div.widget-row-humidity div.row-item',
-        "summary": 'div[data-stat-value*="weather"] div.widget-row-icon div.row-item div.tooltip',
+        "times": [
+            ".widget__row_time .w_time",
+            ".widget__row_time [title]",
+            ".widget-row-time .row-item",
+            ".widget-row-time [title]",
+            '[class*="row_time"] [title]',
+            '[class*="row-time"] [title]',
+            'div[data-stat-value*="weather"] div.widget-row-time div.row-item',
+        ],
+        "temperature": [
+            ".w_temperature .value > .unit_temperature_c",
+            ".w_temperature .unit_temperature_c",
+            'div[data-widget-id="temperature"] .unit_temperature_c',
+            '[data-widget-id*="temperature"] .unit_temperature_c',
+            'div[data-stat-value*="weather"] div.widget-row-chart-temperature div.value span.unit_temperature_c',
+        ],
+        "pressure": [
+            ".widget__row_pressure .unit_pressure_mm_hg_atm",
+            ".w_pressure .unit_pressure_mm_hg_atm",
+            '[data-widget-id="pressure"] .unit_pressure_mm_hg_atm',
+            'div[data-stat-value*="pressure"] div.widget-row-chart-pressure div.value span.unit_pressure_mm_hg_atm',
+        ],
+        "wind_speed": [
+            ".widget__row_wind .w_wind span.unit_wind_m_s",
+            ".widget__row_wind .w_wind span.unit_wind_km_h",
+            '[data-widget-id="wind"] .w_wind span.unit_wind_km_h',
+            'div[data-stat-value*="wind"] div.widget-row-wind-speed div.row-item span.unit_wind_m_s',
+        ],
+        "wind_gust": [
+            ".widget__row_wind .w_gust span.unit_wind_m_s",
+            ".widget__row_wind .w_gust span.unit_wind_km_h",
+            '[data-widget-id="wind"] .w_gust span',
+            'div[data-stat-value*="wind"] div.widget-row-wind-gust div.row-item span.unit_wind_m_s',
+        ],
+        "wind_direction": [
+            ".widget__row_wind .w_wind_direction",
+            ".widget__row_wind .w_direction",
+            '[data-widget-id="wind"] .direction',
+            'div[data-stat-value*="wind"] div.widget-row-wind-direction div.row-item div.direction',
+        ],
+        "precipitation": [
+            ".widget__row_precipitation .unit_precipitation_mm",
+            ".widget__row_precipitation .w_precipitation",
+            '[data-widget-id="precipitation"] .item-unit',
+            'div[data-stat-value*="weather"] div.widget-row-precipitation-bars div.row-item div.item-unit',
+        ],
+        "humidity": [
+            'div[data-widget-id="humidity"] .w-humidity',
+            ".widget__row_humidity .w_humidity",
+            ".widget__row_humidity .w-humidity",
+            'div[data-stat-value*="humidity"] div.widget-row-humidity div.row-item',
+        ],
+        "summary": [
+            ".widget__row_weather .tooltip",
+            ".widget__row_icon .tooltip",
+            ".w_icon[title]",
+            'div[data-stat-value*="weather"] div.widget-row-icon div.row-item div.tooltip',
+        ],
     }
     DAILY_SELECTORS = {
-        "dates": 'div[data-stat-value*="weather"] div.widget-row-days-date div.date',
-        "tmax": 'div[data-stat-value*="weather"] div.widget-row-chart-temperature div.value div.maxt span.unit_temperature_c',
-        "tmin": 'div[data-stat-value*="weather"] div.widget-row-chart-temperature div.value div.mint span.unit_temperature_c',
-        "tavg": 'div[data-stat-value*="temperature-avg"] div.value span.unit_temperature_c',
-        "pressure": 'div[data-stat-value*="pressure"] div.widget-row-chart-pressure div.value div.maxt span.unit_pressure_mm_hg_atm',
-        "wind_speed": 'div[data-stat-value*="wind"] div.widget-row-wind-speed div.row-item span.unit_wind_m_s',
-        "wind_gust": 'div[data-stat-value*="wind"] div.widget-row-wind-gust div.row-item span.unit_wind_m_s',
-        "wind_direction": 'div[data-stat-value*="wind"] div.widget-row-wind-direction div.row-item div.direction',
-        "precipitation": 'div[data-stat-value*="weather"] div.widget-row-precipitation-bars div.row-item div.item-unit',
-        "humidity": 'div[data-stat-value*="humidity"] div.widget-row-humidity div.row-item',
-        "summary": 'div[data-stat-value*="weather"] div.widget-row-icon div.row-item div.tooltip',
+        "dates": [
+            ".widget__row_time .w_time",
+            ".widget__row_date .w_date",
+            ".widget-row-days-date .date",
+            '[class*="row_date"] [title]',
+            'div[data-stat-value*="weather"] div.widget-row-days-date div.date',
+        ],
+        "tmax": [
+            ".w_temperature .maxt .unit_temperature_c",
+            ".widget__row_temperature .maxt .unit_temperature_c",
+            'div[data-stat-value*="weather"] div.widget-row-chart-temperature div.value div.maxt span.unit_temperature_c',
+        ],
+        "tmin": [
+            ".w_temperature .mint .unit_temperature_c",
+            ".widget__row_temperature .mint .unit_temperature_c",
+            'div[data-stat-value*="weather"] div.widget-row-chart-temperature div.value div.mint span.unit_temperature_c',
+        ],
+        "tavg": [
+            ".w_temperature-avg .unit_temperature_c",
+            ".widget__row_temperature_avg .unit_temperature_c",
+            'div[data-stat-value*="temperature-avg"] div.value span.unit_temperature_c',
+        ],
+        "pressure": [
+            ".widget__row_pressure .unit_pressure_mm_hg_atm",
+            ".w_pressure .unit_pressure_mm_hg_atm",
+            '[data-widget-id="pressure"] .unit_pressure_mm_hg_atm',
+            'div[data-stat-value*="pressure"] div.widget-row-chart-pressure div.value div.maxt span.unit_pressure_mm_hg_atm',
+        ],
+        "wind_speed": [
+            ".widget__row_wind .w_wind span.unit_wind_m_s",
+            ".widget__row_wind .w_wind span.unit_wind_km_h",
+            '[data-widget-id="wind"] .w_wind span',
+            'div[data-stat-value*="wind"] div.widget-row-wind-speed div.row-item span.unit_wind_m_s',
+        ],
+        "wind_gust": [
+            ".widget__row_wind .w_gust span",
+            '[data-widget-id="wind"] .w_gust span',
+            'div[data-stat-value*="wind"] div.widget-row-wind-gust div.row-item span.unit_wind_m_s',
+        ],
+        "wind_direction": [
+            ".widget__row_wind .w_wind_direction",
+            ".widget__row_wind .w_direction",
+            '[data-widget-id="wind"] .direction',
+            'div[data-stat-value*="wind"] div.widget-row-wind-direction div.row-item div.direction',
+        ],
+        "precipitation": [
+            ".widget__row_precipitation .w_precipitation",
+            '[data-widget-id="precipitation"] .item-unit',
+            'div[data-stat-value*="weather"] div.widget-row-precipitation-bars div.row-item div.item-unit',
+        ],
+        "humidity": [
+            'div[data-widget-id="humidity"] .w-humidity',
+            ".widget__row_humidity .w_humidity",
+            ".widget__row_humidity .w-humidity",
+            'div[data-stat-value*="humidity"] div.widget-row-humidity div.row-item',
+        ],
+        "summary": [
+            ".widget__row_weather .tooltip",
+            ".widget__row_icon .tooltip",
+            ".w_icon[title]",
+            'div[data-stat-value*="weather"] div.widget-row-icon div.row-item div.tooltip',
+        ],
     }
 
     def __init__(self) -> None:
@@ -232,57 +361,77 @@ class GismeteoClient:
         ) from last_error
 
     @staticmethod
-    def _values(soup: BeautifulSoup, selector: str, attr: str | None = None) -> list[str]:
-        result = []
-        for node in soup.select(selector):
-            value = node.get(attr, "") if attr else _text(node)
-            result.append(str(value).strip())
+    def _values(soup: BeautifulSoup, selector: str | list[str], attr: str | None = None) -> list[str]:
+        selectors = [selector] if isinstance(selector, str) else selector
+        for candidate in selectors:
+            result: list[str] = []
+            for node in soup.select(candidate):
+                value = node.get(attr, "") if attr else _text(node)
+                cleaned = _clean_duplicate_fragment(str(value))
+                if cleaned:
+                    result.append(cleaned)
+            if result:
+                return result
+        return []
+
+    def _time_values(self, soup: BeautifulSoup, label: str) -> list[datetime]:
+        raw_values = self._values(soup, self.HOURLY_SELECTORS["times"])
+        result: list[datetime] = []
+        day = datetime.now(self.tz).date()
+        if label.lower() == "завтра":
+            day += timedelta(days=1)
+
+        for raw in raw_values:
+            parsed = _parse_datetime_title(raw)
+            if parsed is None:
+                match = re.search(r"(?<!\\d)(\\d{1,2}):(\\d{2})(?!\\d)", raw)
+                if match:
+                    try:
+                        parsed = datetime(
+                            day.year, day.month, day.day,
+                            int(match.group(1)), int(match.group(2)),
+                            tzinfo=self.tz,
+                        )
+                    except ValueError:
+                        parsed = None
+            if parsed is not None and parsed not in result:
+                result.append(parsed)
         return result
 
     def _parse_hourly_page(self, html: str, label: str) -> list[ForecastPoint]:
         soup = BeautifulSoup(html, "lxml")
-        raw_times = [
-            value for value in self._values(soup, self.HOURLY_SELECTORS["times"], "title")
-            if _parse_datetime_title(value) is not None
-        ]
-        if not raw_times:
-            # Fallback: inspect title/time attributes when Gismeteo changes row wrappers or class names.
-            discovered: list[str] = []
-            seen: set[str] = set()
+        parsed_times = self._time_values(soup, label)
+        if not parsed_times:
+            # Last-resort extraction from timestamp attributes, constrained to time/date-like nodes.
             candidates = soup.select("[title], [datetime], [data-time], [data-date]")
+            discovered: list[datetime] = []
             for node in candidates:
-                title = str(
-                    node.get("title")
-                    or node.get("datetime")
-                    or node.get("data-time")
-                    or node.get("data-date")
-                    or ""
+                raw = str(
+                    node.get("title") or node.get("datetime")
+                    or node.get("data-time") or node.get("data-date") or ""
                 ).strip()
-                if not title or _parse_datetime_title(title) is None:
-                    continue
+                parsed = _parse_datetime_title(_clean_duplicate_fragment(raw))
                 classes = " ".join(node.get("class", []))
                 parent_classes = " ".join(node.parent.get("class", [])) if node.parent else ""
-                context = f"{classes} {parent_classes}".lower()
-                # Prefer nodes from a time/date row; if classes have been renamed,
-                # retain all parseable timestamps as the final fallback.
-                if any(token in context for token in ("time", "row-item", "date")) and title not in seen:
-                    seen.add(title)
-                    discovered.append(title)
-
-            if not discovered:
-                for node in candidates:
-                    title = str(
-                        node.get("title")
-                        or node.get("datetime")
-                        or node.get("data-time")
-                        or node.get("data-date")
-                        or ""
-                    ).strip()
-                    if title and _parse_datetime_title(title) is not None and title not in seen:
-                        seen.add(title)
-                        discovered.append(title)
-
-            raw_times = discovered
+                if parsed and any(token in f"{classes} {parent_classes}".lower() for token in ("time", "date")):
+                    if parsed not in discovered:
+                        discovered.append(parsed)
+            parsed_times = discovered
+        if not parsed_times:
+            data_widget_ids = sorted({
+                str(node.get("data-widget-id", "")).strip()
+                for node in soup.select("[data-widget-id]")
+                if node.get("data-widget-id")
+            })
+            class_hints = sorted({
+                cls for node in soup.select('[class*="temperature"], [class*="wind"], [class*="humidity"], [class*="time"]')
+                for cls in node.get("class", [])
+            })
+            raise RuntimeError(
+                f"На странице {label} не найден временной ряд. "
+                f"data-widget-id: {data_widget_ids[:30]}; классы погодных блоков: {class_hints[:60]}. "
+                "HTML сохранён в /app/debug."
+            )
 
         if not raw_times:
             data_stat_values = sorted({
@@ -303,10 +452,7 @@ class GismeteoClient:
                 f"похожие классы: {class_hints[:40]}; текст страницы: {body_sample!r}. "
                 "Сохранён HTML в /app/debug."
             )
-        times = [_parse_datetime_title(value) for value in raw_times]
-        if any(item is None for item in times):
-            unresolved = [raw_times[i] for i, item in enumerate(times) if item is None]
-            raise RuntimeError(f"Не удалось разобрать время в title: {unresolved[:3]}")
+        times = parsed_times
 
         values = {
             "temperature": self._values(soup, self.HOURLY_SELECTORS["temperature"]),
